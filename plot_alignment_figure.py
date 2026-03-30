@@ -1,35 +1,17 @@
 # -*- coding: utf-8 -*-
-"""
-Generate a CVPR-style 3-panel alignment visualization figure:
-(a) before alignment overlay
-(b) after alignment overlay
-(c) depth profile along a selected line
-
-Also save each individual panel without titles.
-Also copy the raw input RGB/depth files into the output directory.
-
-Usage example:
-python plot_alignment_figure_cvpr.py \
-    --before-rgb before_rgb.png \
-    --after-rgb after_rgb.png \
-    --real-rgb real_rgb.png \
-    --before-depth before_depth.npy \
-    --after-depth after_depth.npy \
-    --real-depth real_depth.npy \
-    --out alignment_cvpr.png \
-    --line-mode horizontal \
-    --line-y 1200
-"""
-
 import os
+os.environ["MPLBACKEND"] = "Agg"   # 强制非交互后端，避免 TkAgg
+
 import shutil
 import argparse
 from pathlib import Path
 
 import cv2
 import numpy as np
-import matplotlib.pyplot as plt
 
+import matplotlib
+matplotlib.use("Agg")        
+import matplotlib.pyplot as plt
 
 plt.rcParams.update({
     "font.size": 11,
@@ -402,14 +384,40 @@ if __name__ == "__main__":
 """
 
 python plot_alignment_figure.py \
+    --before-rgb lidar/nanfang/images/a3cf12d127044b038f231ccdc5ece529ba9af165.jpg \
+    --after-rgb lidar/nanfang_final/images/a3cf12d127044b038f231ccdc5ece529ba9af165.jpg \
+    --real-rgb recon/nanfang_render/images/a3cf12d127044b038f231ccdc5ece529ba9af165.png \
+    --before-depth lidar/nanfang/depth_npy/a3cf12d127044b038f231ccdc5ece529ba9af165.npy \
+    --after-depth lidar/nanfang_final/depth_npy/a3cf12d127044b038f231ccdc5ece529ba9af165.npy \
+    --real-depth recon/nanfang_render/depth_npy/a3cf12d127044b038f231ccdc5ece529ba9af165.npy \
+    --out ./vis/nanfang/alignment_vis.png \
+    --line-mode horizontal \
+    --line-y 700
+
+
+
+python plot_alignment_figure.py \
+    --before-rgb lidar/xiaoxiang/images/1e4231ddb0484349c51820eff1dfb82275b04a0b.jpg \
+    --after-rgb lidar/xiaoxiang_final/images/1e4231ddb0484349c51820eff1dfb82275b04a0b.jpg \
+    --real-rgb recon/xiaoxiang_render/images/1e4231ddb0484349c51820eff1dfb82275b04a0b.png \
+    --before-depth lidar/xiaoxiang/depth_npy/1e4231ddb0484349c51820eff1dfb82275b04a0b.npy \
+    --after-depth lidar/xiaoxiang_final/depth_npy/1e4231ddb0484349c51820eff1dfb82275b04a0b.npy \
+    --real-depth recon/xiaoxiang_render/depth_npy/1e4231ddb0484349c51820eff1dfb82275b04a0b.npy \
+    --out ./vis/xiaoxiang/alignment_vis.png \
+    --line-mode horizontal \
+    --line-y 300
+
+
+python plot_alignment_figure.py \
     --before-rgb lidar/yanghaitang/images/5f10b891dad1872196860f7646d73146da747bd0.jpg \
     --after-rgb lidar/yanghaitang_final/images/5f10b891dad1872196860f7646d73146da747bd0.jpg \
     --real-rgb recon/yanghaitang_render/images/5f10b891dad1872196860f7646d73146da747bd0.png \
     --before-depth lidar/yanghaitang/depth_npy/5f10b891dad1872196860f7646d73146da747bd0.npy \
     --after-depth lidar/yanghaitang_final/depth_npy/5f10b891dad1872196860f7646d73146da747bd0.npy \
     --real-depth recon/yanghaitang_render/depth_npy/5f10b891dad1872196860f7646d73146da747bd0.npy \
-    --out ./vis/alignment_vis.png \
+    --out ./vis/yanghaitang/alignment_vis.png \
     --line-mode horizontal \
     --line-y 500
+
 
 """

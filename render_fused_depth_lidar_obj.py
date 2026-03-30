@@ -2,11 +2,12 @@
 import os
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"  # 必须放在 import cv2 之前
 
+import gc
 import cv2
-import json
-import argparse
 import shutil
+import argparse
 from pathlib import Path
+from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -57,7 +58,7 @@ def find_cam_txts(cams_dir: Path):
     return txts
 
 
-def read_view_list_txt(view_list_txt: str, pair_list_txt: str):
+def read_view_list_txt(view_list_txt: Optional[str], pair_list_txt: Optional[str]):
     names = []
 
     if view_list_txt is not None:
@@ -123,6 +124,83 @@ def filter_cam_txts_by_view_list(cam_txts, selected_names):
     return selected
 
 
+def safe_remove(path: Path):
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception as e:
+        print(f"[WARN] 删除失败: {path} | {e}")
+
+
+def safe_rmtree(path: Path):
+    try:
+        if path.exists():
+            shutil.rmtree(path)
+    except Exception as e:
+        print(f"[WARN] 删除目录失败: {path} | {e}")
+
+
+# =========================
+# Done Flags / Resume
+# =========================
+def touch_done_flag(flag_path: Path):
+    flag_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(flag_path, "w", encoding="utf-8") as f:
+        f.write("done\n")
+
+
+def has_done_flag(done_dir: Path, name: str) -> bool:
+    return (done_dir / f"{name}.done").exists()
+
+
+def sanitize_source_done_flags(cams, out_npy_dir: Path, done_dir: Path):
+    """
+    如果 done 标记存在，但 npy 丢了，说明状态不一致，移除 done 标记。
+    """
+    for cam in cams:
+        name = cam["name"]
+        flag_path = done_dir / f"{name}.done"
+        npy_path = out_npy_dir / f"{name}.npy"
+        if flag_path.exists() and (not npy_path.exists()):
+            safe_remove(flag_path)
+
+
+def is_fuse_output_complete(out_dirs: dict, name: str):
+    required = [
+        out_dirs["fused_exr"] / f"{name}.exr",
+        out_dirs["fused_vis"] / f"{name}.png",
+        out_dirs["depth_lidar_vis"] / f"{name}.png",
+        out_dirs["depth_obj_vis"] / f"{name}.png",
+        out_dirs["fusion_debug"] / f"{name}.png",
+        out_dirs["replace_mask"] / f"{name}.png",
+        out_dirs["fuse_done"] / f"{name}.done",
+    ]
+    return all(p.exists() for p in required)
+
+
+def sanitize_fuse_done_flags(cams, out_dirs: dict):
+    """
+    如果 fuse done 存在但最终结果文件不完整，移除 fuse done，允许自动重跑。
+    """
+    for cam in cams:
+        name = cam["name"]
+        done_flag = out_dirs["fuse_done"] / f"{name}.done"
+        if done_flag.exists() and (not is_fuse_output_complete(out_dirs, name)):
+            safe_remove(done_flag)
+
+
+def get_completed_fuse_names(cams, out_dirs: dict):
+    completed = set()
+    for cam in cams:
+        name = cam["name"]
+        if is_fuse_output_complete(out_dirs, name):
+            completed.add(name)
+    return completed
+
+
+# =========================
+# Image IO
+# =========================
 def resolve_input_jpg(image_root: Path, name: str) -> Path:
     candidates = [
         image_root / f"{name}.jpg",
@@ -157,13 +235,7 @@ def save_png_image(out_path: Path, img_bgr):
         raise RuntimeError(f"保存 PNG 失败: {out_path}")
 
 
-def save_json(path: Path, obj):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-
-
-def build_image_index(image_root: Path):
+def build_image_index(image_root: Optional[Path]):
     if image_root is None:
         return None
 
@@ -179,7 +251,7 @@ def build_image_index(image_root: Path):
     return index
 
 
-def resolve_input_image_from_index(image_index: dict, image_root: Path, name: str) -> Path:
+def resolve_input_image_from_index(image_index: Optional[dict], image_root: Path, name: str) -> Path:
     if image_index is not None and name in image_index:
         return image_index[name]
     return resolve_input_jpg(image_root, name)
@@ -352,7 +424,7 @@ class VisCache:
 
 
 # =========================
-# Camera / Render
+# Camera / Prepare
 # =========================
 def _prepare_one_camera_worker(
     idx,
@@ -372,6 +444,7 @@ def _prepare_one_camera_worker(
 
     if image_root is not None and images_dir is not None:
         out_img_path = images_dir / f"{cam['name']}.png"
+
         if not out_img_path.exists():
             src_img_path = resolve_input_image_from_index(image_index, image_root, cam["name"])
 
@@ -384,10 +457,12 @@ def _prepare_one_camera_worker(
                 if in_w == cam["w"] and in_h == cam["h"]:
                     shutil.copy2(str(src_img_path), str(out_img_path))
                     direct_copy = True
+                del img
 
             if not direct_copy:
                 img_bgr = read_and_resize_image_to_cam(src_img_path, cam["w"], cam["h"])
                 save_png_image(out_img_path, img_bgr)
+                del img_bgr
 
     return idx, cam
 
@@ -396,8 +471,8 @@ def prepare_cameras(
     cam_txts,
     max_image_edge: int,
     cam_out_dir: Path,
-    image_root: Path = None,
-    images_dir: Path = None,
+    image_root: Optional[Path] = None,
+    images_dir: Optional[Path] = None,
     prepare_workers: int = 0,
 ):
     if len(cam_txts) == 0:
@@ -437,6 +512,7 @@ def prepare_cameras(
                     image_index,
                 )
             )
+
         for fut in tqdm(as_completed(futures), total=len(futures), desc="Prepare Cameras"):
             idx, cam = fut.result()
             results[idx] = cam
@@ -501,36 +577,9 @@ def fuse_depth_keep_nearest(prev_depth: np.ndarray, curr_depth: np.ndarray):
     fused[only_prev] = prev_depth[only_prev]
     fused[only_curr] = curr_depth[only_curr]
     fused[both_valid] = np.minimum(prev_depth[both_valid], curr_depth[both_valid])
+
+    del prev_valid, curr_valid, only_prev, only_curr, both_valid
     return fused.astype(np.float32)
-
-
-def make_depth_vis(depth, invalid_color=(0, 0, 0), percentile_min=1.0, percentile_max=99.0):
-    h, w = depth.shape
-    valid = np.isfinite(depth) & (depth > 1e-8)
-
-    vis = np.zeros((h, w, 3), dtype=np.uint8)
-    if not np.any(valid):
-        return vis
-
-    d = depth[valid]
-    dmin = np.percentile(d, percentile_min)
-    dmax = np.percentile(d, percentile_max)
-    if dmax <= dmin:
-        dmax = dmin + 1e-6
-
-    depth_norm = np.zeros_like(depth, dtype=np.float32)
-    depth_norm[valid] = np.clip((depth[valid] - dmin) / (dmax - dmin), 0.0, 1.0)
-
-    depth_inv = np.zeros_like(depth_norm, dtype=np.float32)
-    depth_inv[valid] = 1.0 - depth_norm[valid]
-
-    depth_u8 = np.zeros((h, w), dtype=np.uint8)
-    depth_u8[valid] = np.clip(depth_inv[valid] * 255.0, 0, 255).astype(np.uint8)
-
-    vis_bgr = cv2.applyColorMap(depth_u8, cv2.COLORMAP_JET)
-    vis = cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2RGB)
-    vis[~valid] = np.array(invalid_color, dtype=np.uint8)
-    return vis
 
 
 def save_depth_npy(out_path: Path, depth):
@@ -538,10 +587,10 @@ def save_depth_npy(out_path: Path, depth):
     np.save(str(out_path), depth.astype(np.float32), allow_pickle=False)
 
 
-def load_depth_npy(in_path: Path):
+def load_depth_npy_memmap(in_path: Path):
     if not in_path.exists():
         return None
-    return np.load(str(in_path), allow_pickle=False).astype(np.float32)
+    return np.load(str(in_path), mmap_mode="r", allow_pickle=False)
 
 
 def save_depth_exr(out_path: Path, depth):
@@ -551,17 +600,64 @@ def save_depth_exr(out_path: Path, depth):
         raise RuntimeError(f"保存 EXR 失败: {out_path}")
 
 
-def save_depth_vis_png(out_path: Path, vis_rgb):
+def resize_vis_if_needed(img, vis_max_edge: Optional[int], is_mask: bool = False):
+    if vis_max_edge is None or vis_max_edge <= 0:
+        return img
+
+    h, w = img.shape[:2]
+    max_edge = max(h, w)
+    if max_edge <= vis_max_edge:
+        return img
+
+    scale = float(vis_max_edge) / float(max_edge)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    interp = cv2.INTER_NEAREST if is_mask else cv2.INTER_AREA
+    return cv2.resize(img, (new_w, new_h), interpolation=interp)
+
+
+def make_depth_vis_bgr(depth, invalid_color=(0, 0, 0), percentile_min=1.0, percentile_max=99.0):
+    h, w = depth.shape
+    valid = np.isfinite(depth) & (depth > 1e-8)
+
+    vis_bgr = np.zeros((h, w, 3), dtype=np.uint8)
+    if not np.any(valid):
+        return vis_bgr
+
+    d = np.asarray(depth[valid], dtype=np.float32)
+    dmin = np.percentile(d, percentile_min)
+    dmax = np.percentile(d, percentile_max)
+    if dmax <= dmin:
+        dmax = dmin + 1e-6
+
+    depth_norm = np.zeros((h, w), dtype=np.float32)
+    depth_norm[valid] = np.clip((depth[valid] - dmin) / (dmax - dmin), 0.0, 1.0)
+
+    depth_inv = np.zeros((h, w), dtype=np.float32)
+    depth_inv[valid] = 1.0 - depth_norm[valid]
+
+    depth_u8 = np.zeros((h, w), dtype=np.uint8)
+    depth_u8[valid] = np.clip(depth_inv[valid] * 255.0, 0, 255).astype(np.uint8)
+
+    vis_bgr = cv2.applyColorMap(depth_u8, cv2.COLORMAP_JET)
+    vis_bgr[~valid] = np.array(invalid_color, dtype=np.uint8)
+
+    del valid, d, depth_norm, depth_inv, depth_u8
+    return vis_bgr
+
+
+def save_vis_png(out_path: Path, vis_bgr, vis_max_edge=None):
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    vis_bgr = cv2.cvtColor(vis_rgb, cv2.COLOR_RGB2BGR)
+    vis_bgr = resize_vis_if_needed(vis_bgr, vis_max_edge, is_mask=False)
     ok = cv2.imwrite(str(out_path), vis_bgr)
     if not ok:
-        raise RuntimeError(f"保存深度可视化失败: {out_path}")
+        raise RuntimeError(f"保存 PNG 失败: {out_path}")
 
 
-def save_mask_png(out_path: Path, mask_bool):
+def save_mask_png(out_path: Path, mask_bool, vis_max_edge=None):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     mask_u8 = (mask_bool.astype(np.uint8) * 255)
+    mask_u8 = resize_vis_if_needed(mask_u8, vis_max_edge, is_mask=True)
     ok = cv2.imwrite(str(out_path), mask_u8)
     if not ok:
         raise RuntimeError(f"保存 mask 失败: {out_path}")
@@ -576,7 +672,7 @@ def resolve_mask_file(mask_root: Path, name: str):
     return None
 
 
-def load_optional_binary_mask(mask_root: Path, name: str, h: int, w: int, dilate_px: int = 0):
+def load_optional_binary_mask(mask_root: Optional[Path], name: str, h: int, w: int, dilate_px: int = 0):
     if mask_root is None:
         return None
 
@@ -609,239 +705,363 @@ def load_optional_binary_mask(mask_root: Path, name: str, h: int, w: int, dilate
     return mask.astype(bool)
 
 
+def remove_small_connected_components(mask: Optional[np.ndarray], min_area: int, connectivity: int = 8):
+    if mask is None:
+        return None
+
+    mask_u8 = mask.astype(np.uint8)
+    if min_area is None or min_area <= 1:
+        return mask_u8.astype(bool)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=connectivity)
+    out = np.zeros_like(mask_u8, dtype=np.uint8)
+
+    for label_id in range(1, num_labels):  # 0 是背景
+        area = int(stats[label_id, cv2.CC_STAT_AREA])
+        if area >= int(min_area):
+            out[labels == label_id] = 1
+
+    return out.astype(bool)
+
+
 def fuse_lidar_obj_depth(
     lidar_depth: np.ndarray,
     obj_depth: np.ndarray,
     veg_mask: np.ndarray = None,
     replace_abs_thr: float = 1.5,
     replace_rel_thr: float = 0.15,
+    min_replace_area: int = 64,
 ):
+    """
+    返回:
+        fused_depth
+        debug_mask      = fill_from_obj | replace_mask
+        replace_mask    = 仅“两者都有值但需要替换”的区域，并已去掉小连通域
+        fill_from_obj   = 激光无值、OBJ 直接覆盖的区域（不做小区域过滤）
+    """
     if lidar_depth is None and obj_depth is None:
-        return None, {}
+        return None, None, None, None
 
     if lidar_depth is None:
-        out = obj_depth.astype(np.float32)
-        stats = {
-            "num_fill_from_obj": int(np.sum(is_valid_depth(obj_depth))),
-            "num_replace_from_obj": 0,
-            "num_veg_protected": 0,
-            "num_keep_lidar": 0,
-            "num_valid_fused": int(np.sum(is_valid_depth(out))),
-        }
-        return out, stats
+        out = np.asarray(obj_depth, dtype=np.float32).copy()
+        fill_from_obj = is_valid_depth(obj_depth)
+        replace_mask = np.zeros_like(fill_from_obj, dtype=bool)
+        debug_mask = fill_from_obj | replace_mask
+        return out, debug_mask, replace_mask, fill_from_obj
 
     if obj_depth is None:
-        out = lidar_depth.astype(np.float32)
-        stats = {
-            "num_fill_from_obj": 0,
-            "num_replace_from_obj": 0,
-            "num_veg_protected": 0,
-            "num_keep_lidar": int(np.sum(is_valid_depth(out))),
-            "num_valid_fused": int(np.sum(is_valid_depth(out))),
-        }
-        return out, stats
+        out = np.asarray(lidar_depth, dtype=np.float32).copy()
+        fill_from_obj = np.zeros_like(out, dtype=bool)
+        replace_mask = np.zeros_like(out, dtype=bool)
+        debug_mask = fill_from_obj | replace_mask
+        return out, debug_mask, replace_mask, fill_from_obj
 
     if lidar_depth.shape != obj_depth.shape:
         raise ValueError(f"lidar_depth.shape != obj_depth.shape: {lidar_depth.shape} vs {obj_depth.shape}")
-
-    h, w = lidar_depth.shape[:2]
-    if veg_mask is not None and veg_mask.shape[:2] != (h, w):
-        raise ValueError("veg_mask shape mismatch")
 
     lidar_valid = is_valid_depth(lidar_depth)
     obj_valid = is_valid_depth(obj_depth)
     both_valid = lidar_valid & obj_valid
 
-    out = np.zeros_like(lidar_depth, dtype=np.float32)
+    out = np.zeros_like(np.asarray(lidar_depth), dtype=np.float32)
     out[lidar_valid] = lidar_depth[lidar_valid]
 
+    # 1) 直接覆盖区域：激光无值而 OBJ 有值
     fill_from_obj = (~lidar_valid) & obj_valid
     out[fill_from_obj] = obj_depth[fill_from_obj]
 
+    # 2) 需要替换区域：两者都有值，OBJ 更近且差异足够大
     diff = np.abs(lidar_depth - obj_depth)
     rel = diff / np.maximum(lidar_depth, 1e-6)
     big_diff = (diff > float(replace_abs_thr)) & (rel > float(replace_rel_thr))
     obj_is_closer = obj_depth < lidar_depth
 
-    replace_mask = both_valid & big_diff & obj_is_closer
+    replace_mask_raw = both_valid & big_diff & obj_is_closer
 
-    veg_protected = np.zeros_like(replace_mask, dtype=bool)
     if veg_mask is not None:
-        veg_protected = replace_mask & veg_mask
-        replace_mask = replace_mask & (~veg_mask)
+        replace_mask_raw = replace_mask_raw & (~veg_mask)
+
+    # 只对 replace 区域去掉小连通域
+    replace_mask = remove_small_connected_components(
+        replace_mask_raw,
+        min_area=min_replace_area,
+        connectivity=8,
+    )
 
     out[replace_mask] = obj_depth[replace_mask]
+    debug_mask = fill_from_obj | replace_mask
 
-    stats = {
-        "num_lidar_valid": int(np.sum(lidar_valid)),
-        "num_obj_valid": int(np.sum(obj_valid)),
-        "num_both_valid": int(np.sum(both_valid)),
-        "num_fill_from_obj": int(np.sum(fill_from_obj)),
-        "num_replace_from_obj": int(np.sum(replace_mask)),
-        "num_veg_protected": int(np.sum(veg_protected)),
-        "num_keep_lidar": int(np.sum(lidar_valid) - int(np.sum(replace_mask))),
-        "num_valid_fused": int(np.sum(is_valid_depth(out))),
-    }
-
-    debug = {
-        "fill_from_obj": fill_from_obj,
-        "replace_from_obj": replace_mask,
-        "veg_protected": veg_protected,
-    }
-    return out.astype(np.float32), stats, debug
+    del lidar_valid, obj_valid, both_valid
+    del diff, rel, big_diff, obj_is_closer, replace_mask_raw
+    return out.astype(np.float32), debug_mask, replace_mask, fill_from_obj
 
 
 # =========================
 # Output Dirs
 # =========================
-def ensure_dirs(output_root: Path, save_vis: bool, save_images: bool):
+def ensure_dirs(output_root: Path, save_images: bool):
     output_root.mkdir(parents=True, exist_ok=True)
 
-    cam_out_dir = output_root / "cams"
-    cam_out_dir.mkdir(parents=True, exist_ok=True)
+    dirs = {
+        "fused_exr": output_root / "fused_exr",
+        "fused_vis": output_root / "fused_vis",
+        "depth_lidar_vis": output_root / "depth_lidar_vis",
+        "depth_obj_vis": output_root / "depth_obj_vis",
+        "fusion_debug": output_root / "fusion_debug",
+        "replace_mask": output_root / "replace_mask",
+        "cams": output_root / "cams",
+        "images": (output_root / "images") if save_images else None,
 
-    image_dir = None
-    if save_images:
-        image_dir = output_root / "images"
-        image_dir.mkdir(parents=True, exist_ok=True)
+        "temp_lidar_npy": output_root / "_temp_lidar_npy",
+        "temp_obj_npy": output_root / "_temp_obj_npy",
 
-    def build_depth_dirs(prefix: str, with_exr: bool = False):
-        npy_dir = output_root / f"depth_{prefix}_npy"
-        npy_dir.mkdir(parents=True, exist_ok=True)
-
-        exr_dir = None
-        if with_exr:
-            exr_dir = output_root / f"depth_{prefix}_exr"
-            exr_dir.mkdir(parents=True, exist_ok=True)
-
-        vis_dir = None
-        if save_vis:
-            vis_dir = output_root / f"depth_{prefix}_vis"
-            vis_dir.mkdir(parents=True, exist_ok=True)
-
-        return {"npy": npy_dir, "exr": exr_dir, "vis": vis_dir}
-
-    debug_dir = output_root / "fusion_debug"
-    debug_dir.mkdir(parents=True, exist_ok=True)
-
-    return {
-        "images": image_dir,
-        "cams": cam_out_dir,
-        "lidar": build_depth_dirs("lidar", with_exr=False),
-        "obj": build_depth_dirs("obj", with_exr=False),
-        "fused": build_depth_dirs("fused", with_exr=True),
-        "debug": debug_dir,
+        "temp_lidar_done": output_root / "_temp_lidar_done",
+        "temp_obj_done": output_root / "_temp_obj_done",
+        "fuse_done": output_root / "_fuse_done",
     }
+
+    for key, path in dirs.items():
+        if path is not None:
+            path.mkdir(parents=True, exist_ok=True)
+
+    return dirs
 
 
 # =========================
-# Render Source Depth (only NPY in hot loop)
+# Render Source Depth (Temp NPY)
 # =========================
 def render_source_depths_to_npy(
     source_name: str,
     ply_paths,
     cams,
     vis_cache: VisCache,
-    out_dirs: dict,
+    out_npy_dir: Path,
+    done_dir: Path,
+    skip_names: set,
 ):
     print(f"\n[INFO] 开始渲染 {source_name} 点云，共 {len(ply_paths)} 个 ply")
+    out_npy_dir.mkdir(parents=True, exist_ok=True)
+    done_dir.mkdir(parents=True, exist_ok=True)
+
+    pending_cams = []
+    for cam in cams:
+        name = cam["name"]
+        npy_path = out_npy_dir / f"{name}.npy"
+
+        # 最终结果已完整，整个 source render 跳过
+        if name in skip_names:
+            continue
+
+        # source npy 已经完整存在，跳过
+        if npy_path.exists() and has_done_flag(done_dir, name):
+            continue
+
+        # 半成品，删掉重做
+        if npy_path.exists() and (not has_done_flag(done_dir, name)):
+            safe_remove(npy_path)
+
+        pending_cams.append(cam)
+
+    if len(pending_cams) == 0:
+        print(f"[INFO] {source_name}: 全部视角已有结果，跳过")
+        return
 
     for ply_idx, ply_path in enumerate(ply_paths):
         print(f"[INFO] {source_name} ply ({ply_idx + 1}/{len(ply_paths)}): {ply_path}")
         pcd = load_point_cloud(str(ply_path))
-        n_points = np.asarray(pcd.points).shape[0]
-        print(f"[INFO] 当前点云点数: {n_points}")
-
         geom_tag = str(ply_path.resolve())
 
-        for cam in tqdm(cams, desc=f"Render {source_name}:{ply_path.name}"):
+        for cam in tqdm(pending_cams, desc=f"Render {source_name}:{ply_path.name}"):
             name = cam["name"]
             h, w = cam["h"], cam["w"]
+            npy_path = out_npy_dir / f"{name}.npy"
 
             vis, key = vis_cache.get(w, h)
             vis_cache.ensure_geometry(key, pcd, geom_tag)
             set_camera_from_world2cam(vis, cam["intrinsic"], cam["extrinsic"], w, h)
 
             curr_depth = render_depth_only(vis)
-            npy_path = out_dirs["npy"] / f"{name}.npy"
 
             if ply_idx == 0:
                 fused_depth = curr_depth
             else:
-                prev_depth = load_depth_npy(npy_path)
+                prev_depth = load_depth_npy_memmap(npy_path)
                 fused_depth = fuse_depth_keep_nearest(prev_depth, curr_depth)
+                del prev_depth
 
             save_depth_npy(npy_path, fused_depth)
+            del curr_depth, fused_depth
+
+        del pcd
+        gc.collect()
+
+    for cam in pending_cams:
+        touch_done_flag(done_dir / f"{cam['name']}.done")
 
 
 # =========================
-# Deferred Export
+# Fuse / Export
 # =========================
-def _export_one_npy_to_exr(npy_path: Path, exr_path: Path):
-    depth = np.load(str(npy_path), allow_pickle=False).astype(np.float32)
-    save_depth_exr(exr_path, depth)
-    return npy_path.name
+def _export_one_view_worker(
+    cam: dict,
+    temp_lidar_dir: Path,
+    temp_obj_dir: Path,
+    out_dirs: dict,
+    veg_mask_root: Optional[Path],
+    replace_abs_thr: float,
+    replace_rel_thr: float,
+    veg_dilate_px: int,
+    vis_max_edge: Optional[int],
+    min_replace_area: int,
+):
+    name = cam["name"]
+    h, w = cam["h"], cam["w"]
+
+    if is_fuse_output_complete(out_dirs, name):
+        return name, "skip"
+
+    lidar_npy_path = temp_lidar_dir / f"{name}.npy"
+    obj_npy_path = temp_obj_dir / f"{name}.npy"
+
+    if not lidar_npy_path.exists():
+        raise FileNotFoundError(f"缺少 lidar 临时深度: {lidar_npy_path}")
+    if not obj_npy_path.exists():
+        raise FileNotFoundError(f"缺少 obj 临时深度: {obj_npy_path}")
+
+    lidar_depth = load_depth_npy_memmap(lidar_npy_path)
+    obj_depth = load_depth_npy_memmap(obj_npy_path)
+
+    veg_mask = load_optional_binary_mask(
+        veg_mask_root,
+        name,
+        h=h,
+        w=w,
+        dilate_px=veg_dilate_px,
+    )
+
+    fused_depth, debug_mask, replace_mask, fill_from_obj = fuse_lidar_obj_depth(
+        lidar_depth=lidar_depth,
+        obj_depth=obj_depth,
+        veg_mask=veg_mask,
+        replace_abs_thr=replace_abs_thr,
+        replace_rel_thr=replace_rel_thr,
+        min_replace_area=min_replace_area,
+    )
+
+    fused_exr_path = out_dirs["fused_exr"] / f"{name}.exr"
+    lidar_vis_path = out_dirs["depth_lidar_vis"] / f"{name}.png"
+    obj_vis_path = out_dirs["depth_obj_vis"] / f"{name}.png"
+    fused_vis_path = out_dirs["fused_vis"] / f"{name}.png"
+    debug_mask_path = out_dirs["fusion_debug"] / f"{name}.png"
+    replace_mask_path = out_dirs["replace_mask"] / f"{name}.png"
+
+    if fused_depth is not None and (not fused_exr_path.exists()):
+        save_depth_exr(fused_exr_path, fused_depth)
+
+    if lidar_depth is not None and (not lidar_vis_path.exists()):
+        lidar_vis = make_depth_vis_bgr(lidar_depth)
+        save_vis_png(lidar_vis_path, lidar_vis, vis_max_edge)
+        del lidar_vis
+
+    if obj_depth is not None and (not obj_vis_path.exists()):
+        obj_vis = make_depth_vis_bgr(obj_depth)
+        save_vis_png(obj_vis_path, obj_vis, vis_max_edge)
+        del obj_vis
+
+    if fused_depth is not None and (not fused_vis_path.exists()):
+        fused_vis = make_depth_vis_bgr(fused_depth)
+        save_vis_png(fused_vis_path, fused_vis, vis_max_edge)
+        del fused_vis
+
+    if debug_mask is not None and (not debug_mask_path.exists()):
+        save_mask_png(debug_mask_path, debug_mask, vis_max_edge)
+
+    if replace_mask is not None and (not replace_mask_path.exists()):
+        save_mask_png(replace_mask_path, replace_mask, vis_max_edge)
+
+    # 只在最终文件完整时打 done 标记
+    required_now = [
+        fused_exr_path,
+        lidar_vis_path,
+        obj_vis_path,
+        fused_vis_path,
+        debug_mask_path,
+        replace_mask_path,
+    ]
+    if all(p.exists() for p in required_now):
+        touch_done_flag(out_dirs["fuse_done"] / f"{name}.done")
+
+    del fused_depth, debug_mask, replace_mask, fill_from_obj, veg_mask
+    del lidar_depth, obj_depth
+    gc.collect()
+
+    # 该视角最终结果完整后，删除 temp
+    if is_fuse_output_complete(out_dirs, name):
+        safe_remove(lidar_npy_path)
+        safe_remove(obj_npy_path)
+
+    return name, "done"
 
 
-def export_npy_dir_to_exr(npy_dir: Path, exr_dir: Path, workers: int = 0):
-    npy_files = sorted(npy_dir.glob("*.npy"))
-    if len(npy_files) == 0:
+def fuse_and_export_per_view(
+    cams,
+    temp_lidar_dir: Path,
+    temp_obj_dir: Path,
+    out_dirs: dict,
+    veg_mask_root: Optional[Path],
+    replace_abs_thr: float,
+    replace_rel_thr: float,
+    veg_dilate_px: int,
+    vis_max_edge: Optional[int],
+    min_replace_area: int,
+    export_workers: int,
+):
+    print("\n[INFO] 开始逐视角融合并导出最终结果")
+
+    pending_cams = [cam for cam in cams if not is_fuse_output_complete(out_dirs, cam["name"])]
+    if len(pending_cams) == 0:
+        print("[INFO] Fuse + Export: 全部视角已有结果，跳过")
         return
 
-    exr_dir.mkdir(parents=True, exist_ok=True)
+    if export_workers is None or export_workers <= 0:
+        export_workers = min(8, max(1, (os.cpu_count() or 8)))
 
-    if workers is None or workers <= 0:
-        workers = min(8, max(1, (os.cpu_count() or 8) // 2))
-
-    if workers == 1 or len(npy_files) <= 4:
-        for npy_path in tqdm(npy_files, desc=f"Export EXR:{npy_dir.name}"):
-            exr_path = exr_dir / f"{npy_path.stem}.exr"
-            _export_one_npy_to_exr(npy_path, exr_path)
+    if len(pending_cams) <= 2 or export_workers == 1:
+        for cam in tqdm(pending_cams, desc="Fuse + Export"):
+            _export_one_view_worker(
+                cam=cam,
+                temp_lidar_dir=temp_lidar_dir,
+                temp_obj_dir=temp_obj_dir,
+                out_dirs=out_dirs,
+                veg_mask_root=veg_mask_root,
+                replace_abs_thr=replace_abs_thr,
+                replace_rel_thr=replace_rel_thr,
+                veg_dilate_px=veg_dilate_px,
+                vis_max_edge=vis_max_edge,
+                min_replace_area=min_replace_area,
+            )
         return
 
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = []
-        for npy_path in npy_files:
-            exr_path = exr_dir / f"{npy_path.stem}.exr"
-            futures.append(ex.submit(_export_one_npy_to_exr, npy_path, exr_path))
+    futures = []
+    with ThreadPoolExecutor(max_workers=export_workers) as ex:
+        for cam in pending_cams:
+            futures.append(
+                ex.submit(
+                    _export_one_view_worker,
+                    cam,
+                    temp_lidar_dir,
+                    temp_obj_dir,
+                    out_dirs,
+                    veg_mask_root,
+                    replace_abs_thr,
+                    replace_rel_thr,
+                    veg_dilate_px,
+                    vis_max_edge,
+                    min_replace_area,
+                )
+            )
 
-        for fut in tqdm(as_completed(futures), total=len(futures), desc=f"Export EXR:{npy_dir.name}"):
-            fut.result()
-
-
-def _export_one_npy_to_vis(npy_path: Path, vis_path: Path):
-    depth = np.load(str(npy_path), allow_pickle=False).astype(np.float32)
-    vis = make_depth_vis(depth)
-    save_depth_vis_png(vis_path, vis)
-    return npy_path.name
-
-
-def export_npy_dir_to_vis(npy_dir: Path, vis_dir: Path, workers: int = 0):
-    if vis_dir is None:
-        return
-
-    npy_files = sorted(npy_dir.glob("*.npy"))
-    if len(npy_files) == 0:
-        return
-
-    vis_dir.mkdir(parents=True, exist_ok=True)
-
-    if workers is None or workers <= 0:
-        workers = min(16, max(1, os.cpu_count() or 8))
-
-    if workers == 1 or len(npy_files) <= 4:
-        for npy_path in tqdm(npy_files, desc=f"Export VIS:{npy_dir.name}"):
-            vis_path = vis_dir / f"{npy_path.stem}.png"
-            _export_one_npy_to_vis(npy_path, vis_path)
-        return
-
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = []
-        for npy_path in npy_files:
-            vis_path = vis_dir / f"{npy_path.stem}.png"
-            futures.append(ex.submit(_export_one_npy_to_vis, npy_path, vis_path))
-
-        for fut in tqdm(as_completed(futures), total=len(futures), desc=f"Export VIS:{npy_dir.name}"):
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Fuse + Export"):
             fut.result()
 
 
@@ -850,34 +1070,42 @@ def export_npy_dir_to_vis(npy_dir: Path, vis_dir: Path, workers: int = 0):
 # =========================
 def main():
     parser = argparse.ArgumentParser(
-        description="分别渲染激光点云和 OBJ 点云深度图（中间只存 NPY），再融合，最后仅导出 fused EXR。"
+        description=(
+            "先分别渲染激光点云和 OBJ 点云到临时 NPY，再逐视角读取并融合。"
+            "支持按视角断点续跑；已有结果自动跳过；replace 区域可去掉小连通域。"
+        )
     )
     parser.add_argument("lidar_ply_root", type=str, help="激光点云 ply 文件或目录")
     parser.add_argument("obj_ply_root", type=str, help="OBJ 采样点云 ply 文件或目录")
     parser.add_argument("cam_root", type=str, help="相机目录，或其上一级目录（内部应包含 cams/）")
     parser.add_argument("output_root", type=str, help="输出目录")
 
-    parser.add_argument("--image-root", type=str, default=None, help="原始图像目录")
+    parser.add_argument("--image-root", type=str, default=None, help="原始图像目录；提供后会输出 images/")
     parser.add_argument("--veg-mask-root", type=str, default=None, help="植被掩码目录，非零视为植被")
     parser.add_argument("--view-list-txt", type=str, default=None, help="一行一个视角名")
     parser.add_argument("--pair-list-txt", type=str, default=None, help="一行两个视角名")
 
-    parser.add_argument("--max-image-edge", type=int, default=1600, help="最大图像边")
-    parser.add_argument("--prepare-workers", type=int, default=8, help="Prepare Cameras 线程数，<=0 表示自动")
-    parser.add_argument("--export-exr-workers", type=int, default=8, help="最终 fused NPY -> EXR 并发数，<=0 表示自动")
-    parser.add_argument("--export-vis-workers", type=int, default=8, help="NPY -> 可视化 PNG 并发数，<=0 表示自动")
+    parser.add_argument("--max-image-edge", type=int, default=1600, help="渲染与输出 cams/images 使用的最大图像边")
+    parser.add_argument("--vis-max-edge", type=int, default=400, help="可视化 PNG 的最大边，<=0 表示不缩小")
 
-    parser.add_argument("--lidar-point-size", type=float, default=2.0, help="激光点大小")
-    parser.add_argument("--obj-point-size", type=float, default=2.0, help="OBJ 点大小")
+    parser.add_argument("--prepare-workers", type=int, default=8, help="Prepare Cameras 线程数，<=0 表示自动")
+    parser.add_argument("--export-workers", type=int, default=8, help="Fuse + Export 线程数，<=0 表示自动")
+
+    parser.add_argument("--lidar-point-size", type=float, default=3.0, help="激光点大小")
+    parser.add_argument("--obj-point-size", type=float, default=3.0, help="OBJ 点大小")
     parser.add_argument("--visible", action="store_true", help="显示 Open3D 窗口")
 
     parser.add_argument("--replace-abs-thr", type=float, default=1.5, help="差异绝对阈值，单位米")
-    parser.add_argument("--replace-rel-thr", type=float, default=0.15, help="差异相对阈值，相对激光深度")
+    parser.add_argument("--replace-rel-thr", type=float, default=0.0, help="差异相对阈值，相对激光深度")
     parser.add_argument("--veg-dilate-px", type=int, default=2, help="植被掩码膨胀像素，保护边界")
+    parser.add_argument(
+        "--min-replace-area",
+        type=int,
+        default=64,
+        help="仅对 replace 区域做连通域去小块，单位像素；direct fill 不处理",
+    )
 
-    parser.add_argument("--save-depth-vis", action="store_true", help="额外导出 lidar/obj/fused 的深度可视化 PNG")
-    parser.add_argument("--save-debug-mask", action="store_true", help="保存融合调试 mask")
-
+    parser.add_argument("--keep-temp", action="store_true", help="保留 _temp_* 临时结果，默认最终会删除")
     args = parser.parse_args()
 
     lidar_ply_root = Path(args.lidar_ply_root)
@@ -899,7 +1127,6 @@ def main():
 
     dirs = ensure_dirs(
         output_root=output_root,
-        save_vis=args.save_depth_vis,
         save_images=(image_root is not None),
     )
 
@@ -925,111 +1152,81 @@ def main():
         prepare_workers=args.prepare_workers,
     )
 
+    # 修正可能的脏状态
+    sanitize_source_done_flags(cams, dirs["temp_lidar_npy"], dirs["temp_lidar_done"])
+    sanitize_source_done_flags(cams, dirs["temp_obj_npy"], dirs["temp_obj_done"])
+    sanitize_fuse_done_flags(cams, out_dirs=dirs)
+
+    completed_names = get_completed_fuse_names(cams, out_dirs=dirs)
+    if len(completed_names) > 0:
+        print(f"[INFO] 已完成视角数（最终结果完整）: {len(completed_names)}")
+
     lidar_cache = VisCache(point_size=args.lidar_point_size, visible=args.visible)
     obj_cache = VisCache(point_size=args.obj_point_size, visible=args.visible)
 
     try:
-        # 1) 渲染激光深度（仅存 NPY）
         render_source_depths_to_npy(
             source_name="lidar",
             ply_paths=lidar_plys,
             cams=cams,
             vis_cache=lidar_cache,
-            out_dirs=dirs["lidar"],
+            out_npy_dir=dirs["temp_lidar_npy"],
+            done_dir=dirs["temp_lidar_done"],
+            skip_names=completed_names,
         )
 
-        # 2) 渲染 OBJ 深度（仅存 NPY）
         render_source_depths_to_npy(
             source_name="obj",
             ply_paths=obj_plys,
             cams=cams,
             vis_cache=obj_cache,
-            out_dirs=dirs["obj"],
+            out_npy_dir=dirs["temp_obj_npy"],
+            done_dir=dirs["temp_obj_done"],
+            skip_names=completed_names,
         )
 
     finally:
         lidar_cache.close_all()
         obj_cache.close_all()
 
-    # 3) 融合：读取 lidar_npy / obj_npy，输出 fused_npy
-    print("\n[INFO] 开始融合激光深度和 OBJ 深度")
-    fusion_summary = {
-        "replace_abs_thr": float(args.replace_abs_thr),
-        "replace_rel_thr": float(args.replace_rel_thr),
-        "veg_dilate_px": int(args.veg_dilate_px),
-        "per_view": {},
-    }
-
-    debug_fill_dir = dirs["debug"] / "fill_from_obj"
-    debug_replace_dir = dirs["debug"] / "replace_from_obj"
-    debug_veg_dir = dirs["debug"] / "veg_protected"
-
-    for cam in tqdm(cams, desc="Fuse lidar + obj"):
-        name = cam["name"]
-        h, w = cam["h"], cam["w"]
-
-        lidar_depth = load_depth_npy(dirs["lidar"]["npy"] / f"{name}.npy")
-        obj_depth = load_depth_npy(dirs["obj"]["npy"] / f"{name}.npy")
-
-        veg_mask = load_optional_binary_mask(
-            veg_mask_root,
-            name,
-            h=h,
-            w=w,
-            dilate_px=args.veg_dilate_px,
-        )
-
-        fused_ret = fuse_lidar_obj_depth(
-            lidar_depth=lidar_depth,
-            obj_depth=obj_depth,
-            veg_mask=veg_mask,
-            replace_abs_thr=args.replace_abs_thr,
-            replace_rel_thr=args.replace_rel_thr,
-        )
-
-        if fused_ret is None:
-            continue
-
-        if len(fused_ret) == 2:
-            fused_depth, stats = fused_ret
-            debug = None
-        else:
-            fused_depth, stats, debug = fused_ret
-
-        if fused_depth is None:
-            continue
-
-        save_depth_npy(dirs["fused"]["npy"] / f"{name}.npy", fused_depth)
-
-        if args.save_debug_mask and debug is not None:
-            save_mask_png(debug_fill_dir / f"{name}.png", debug["fill_from_obj"])
-            save_mask_png(debug_replace_dir / f"{name}.png", debug["replace_from_obj"])
-            save_mask_png(debug_veg_dir / f"{name}.png", debug["veg_protected"])
-
-        fusion_summary["per_view"][name] = stats
-
-    save_json(output_root / "summary_fusion.json", fusion_summary)
-
-    # 4) 可视化导出（延迟到热路径外）
-    if args.save_depth_vis:
-        print("\n[INFO] 导出深度可视化 PNG")
-        export_npy_dir_to_vis(dirs["lidar"]["npy"], dirs["lidar"]["vis"], workers=args.export_vis_workers)
-        export_npy_dir_to_vis(dirs["obj"]["npy"], dirs["obj"]["vis"], workers=args.export_vis_workers)
-        export_npy_dir_to_vis(dirs["fused"]["npy"], dirs["fused"]["vis"], workers=args.export_vis_workers)
-
-    # 5) 最终只把 fused NPY 批量导出为 EXR
-    print("\n[INFO] 导出最终融合 EXR")
-    export_npy_dir_to_exr(
-        npy_dir=dirs["fused"]["npy"],
-        exr_dir=dirs["fused"]["exr"],
-        workers=args.export_exr_workers,
+    fuse_and_export_per_view(
+        cams=cams,
+        temp_lidar_dir=dirs["temp_lidar_npy"],
+        temp_obj_dir=dirs["temp_obj_npy"],
+        out_dirs=dirs,
+        veg_mask_root=veg_mask_root,
+        replace_abs_thr=args.replace_abs_thr,
+        replace_rel_thr=args.replace_rel_thr,
+        veg_dilate_px=args.veg_dilate_px,
+        vis_max_edge=args.vis_max_edge,
+        min_replace_area=args.min_replace_area,
+        export_workers=args.export_workers,
     )
 
+    if not args.keep_temp:
+        safe_rmtree(dirs["temp_lidar_npy"])
+        safe_rmtree(dirs["temp_obj_npy"])
+
     print(f"\n[INFO] 完成，输出目录: {output_root}")
+    print("[INFO] 最终保留：")
+    print(f"       {dirs['fused_exr']}")
+    print(f"       {dirs['fused_vis']}")
+    print(f"       {dirs['depth_lidar_vis']}")
+    print(f"       {dirs['depth_obj_vis']}")
+    print(f"       {dirs['fusion_debug']}")
+    print(f"       {dirs['replace_mask']}")
+    print(f"       {dirs['cams']}")
+    print(f"       {dirs['fuse_done']}")
+    if dirs["images"] is not None:
+        print(f"       {dirs['images']}")
+    if args.keep_temp:
+        print(f"       {dirs['temp_lidar_npy']}")
+        print(f"       {dirs['temp_obj_npy']}")
 
 
 if __name__ == "__main__":
     main()
+
 
 
 """
@@ -1038,13 +1235,21 @@ python render_fused_depth_lidar_obj.py \
     ./recon/nanfang/models/pc/0 \
     ./recon/nanfang/cams \
     ./scene_fused_render/nanfang \
-    --image-root ./undistort/nanfang/ImageCorrection/undistort \
-    --max-image-edge 1600 \
-    --lidar-point-size 3.0 \
-    --obj-point-size 3.0 \
-    --replace-abs-thr 1.5 \
-    --replace-rel-thr 0.15 \
-    --export-exr-workers 8 \
-    --save-debug-mask \
-    --save-depth-vis
+    --image-root ./undistort/nanfang/ImageCorrection/undistort
+
+python render_fused_depth_lidar_obj.py \
+    ./lidar/yanghaitang/transform/lidar_finall.ply \
+    ./recon/yanghaitang/models/pc/0 \
+    ./recon/yanghaitang/cams \
+    ./scene_fused_render/yanghaitang \
+    --image-root ./undistort/yanghaitang/ImageCorrection/undistort
+
+python render_fused_depth_lidar_obj.py \
+    ./lidar/xiaoxiang/transform/lidar_finall.ply \
+    ./recon/xiaoxiang/models/pc/0 \
+    ./recon/xiaoxiang/cams \
+    ./scene_fused_render/xiaoxiang \
+    --image-root ./undistort/xiaoxiang/ImageCorrection/undistort
+
+
 """
