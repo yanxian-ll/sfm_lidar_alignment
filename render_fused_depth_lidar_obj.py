@@ -724,6 +724,20 @@ def remove_small_connected_components(mask: Optional[np.ndarray], min_area: int,
     return out.astype(bool)
 
 
+def dilate_binary_mask(mask: Optional[np.ndarray], dilate_px: int):
+    if mask is None:
+        return None
+
+    if dilate_px is None or dilate_px <= 0:
+        return mask.astype(bool)
+
+    mask_u8 = mask.astype(np.uint8)
+    k = int(dilate_px) * 2 + 1
+    kernel = np.ones((k, k), dtype=np.uint8)
+    mask_u8 = cv2.dilate(mask_u8, kernel, iterations=1)
+    return mask_u8.astype(bool)
+
+
 def fuse_lidar_obj_depth(
     lidar_depth: np.ndarray,
     obj_depth: np.ndarray,
@@ -731,6 +745,7 @@ def fuse_lidar_obj_depth(
     replace_abs_thr: float = 1.5,
     replace_rel_thr: float = 0.15,
     min_replace_area: int = 64,
+    replace_dilate_px: int = 2,
 ):
     """
     返回:
@@ -781,12 +796,22 @@ def fuse_lidar_obj_depth(
     if veg_mask is not None:
         replace_mask_raw = replace_mask_raw & (~veg_mask)
 
-    # 只对 replace 区域去掉小连通域
-    replace_mask = remove_small_connected_components(
-        replace_mask_raw,
-        min_area=min_replace_area,
-        connectivity=8,
-    )
+
+    # replace_mask = remove_small_connected_components(
+    #     replace_mask_raw,
+    #     min_area=min_replace_area,
+    #     connectivity=8,
+    # )
+
+    # replace_mask = dilate_binary_mask(
+    #     replace_mask,
+    #     dilate_px=replace_dilate_px,
+    # )
+    
+    replace_mask = replace_mask_raw
+
+    if veg_mask is not None:
+        replace_mask = replace_mask & (~veg_mask)
 
     out[replace_mask] = obj_depth[replace_mask]
     debug_mask = fill_from_obj | replace_mask
